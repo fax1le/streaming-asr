@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Microphone → FastAPI (WebSocket)</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 640px;
+      margin: 48px auto;
+      padding: 0 20px;
+      background: #fafafa;
+      color: #222;
+    }
+    h1 { margin-bottom: 8px; }
+    .url-row { display: flex; gap: 8px; margin-top: 16px; }
+    .url-row input {
+      flex: 1;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 0.95rem;
+    }
+    button {
+      padding: 10px 22px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      border: none;
+      border-radius: 6px;
+      color: #fff;
+      background: #4f46e5;
+    }
+    button:hover { background: #4338ca; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    #btnStart { background: #16a34a; }
+    #btnStart:hover { background: #15803d; }
+    #btnStop  { background: #dc2626; }
+    #btnStop:hover  { background: #b91c1c; }
+    #status {
+      margin-top: 18px;
+      font-weight: 500;
+      font-size: 0.95rem;
+    }
+    .bar-container {
+      width: 100%;
+      height: 24px;
+      background: #e5e7eb;
+      border-radius: 6px;
+      margin-top: 14px;
+      overflow: hidden;
+    }
+    .bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #4caf50, #ff9800, #f44336);
+      transition: width 0.08s ease;
+    }
+    #log {
+      margin-top: 18px;
+      background: #1e1e1e;
+      color: #cfcfcf;
+      padding: 14px;
+      border-radius: 8px;
+      max-height: 320px;
+      overflow-y: auto;
+      font-family: 'Cascadia Code', 'Fira Code', monospace;
+      font-size: 0.82rem;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🎤 Live Mic → FastAPI</h1>
+  <p style="color:#666;">Capture your microphone and stream 16-bit PCM audio over WebSocket.</p>
+
+  <!-- Controls -->
+  <div style="display:flex; gap:10px;">
+    <button id="btnConnect">Connect</button>
+    <button id="btnStart" disabled>🎙 Start</button>
+    <button id="btnStop"  disabled>⏹ Stop</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+  </div>
+
+  <!-- Level meter -->
+  <div class="bar-container"><div class="bar" id="levelBar"></div></div>
+  <div id="status">Disconnected</div>
+
+  <!-- Log console -->
+  <div id="log"></div>
+
+<script>
+/* ================================================================
+   Configuration
+   ================================================================ */
+const SERVER_SAMPLE_RATE  = 48_000;   // Target output sample rate (Hz)
+const CHANNELS     = 1;        // Mono
+const BUFFER_MS    = 100;      // Chunk size in milliseconds
+const BIT_DEPTH    = 16;
+
+/* ================================================================
+   DOM references
+   ================================================================ */
+const WS_URL        = 'ws://localhost:8889/ws';
+const btnConnect    = document.getElementById('btnConnect');
+const btnStart      = document.getElementById('btnStart');
+const btnStop       = document.getElementById('btnStop');
+const btnDisconnect = document.getElementById('btnDisconnect');
+const statusEl      = document.getElementById('status');
+const logEl         = document.getElementById('log');
+const levelBar      = document.getElementById('levelBar');
+
+/* ================================================================
+   State
+   ================================================================ */
+let ws          = null;
+let audioCtx    = null;
+let mediaStream = null;
+let sourceNode  = null;
+let scriptNode  = null;
+let isConnected = false;
+let isRecording = false;
+
+/* ================================================================
+   Helpers
+   ================================================================ */
+function log(msg) {
+  const ts = new Date().toLocaleTimeString();
+  logEl.innerHTML += `[${ts}] ${msg}<br>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text) { statusEl.textContent = text; }
+
+/* ================================================================
+   WebSocket lifecycle
+   ================================================================ */
+btnConnect.addEventListener('click', () => {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    isConnected = true;
+    setStatus('✅ Connected');
+    log('WebSocket connected');
+    btnConnect.disabled     = true;
+    btnStart.disabled       = false;
+    btnDisconnect.disabled  = false;
+  };
+
+  ws.onmessage = (evt) => {
+    if (typeof evt.data === 'string') {
+      log(`← ${evt.data}`);
+    } else {
+      log(`← binary (${evt.data.byteLength} bytes)`);
+    }
+  };
+
+  ws.onerror = () => log('❌ WebSocket error');
+
+  ws.onclose = (evt) => {
+    isConnected = false;
+    setStatus('Disconnected');
+    log(`WebSocket closed (${evt.code} ${evt.reason || 'no reason'})`);
+    btnConnect.disabled     = false;
+    btnStart.disabled       = true;
+    btnStop.disabled        = true;
+    btnDisconnect.disabled  = true;
+    stopRecording();
+  };
+});
+
+btnDisconnect.addEventListener('click', () => {
+  stopRecording();
+  if (ws) ws.close(1000, 'Client disconnect');
+});
+
+/* ================================================================
+   Audio capture
+   ================================================================ */
+btnStart.addEventListener('click', startRecording);
+btnStop.addEventListener('click', stopRecording);
+
+async function startRecording() {
+  try {
+    // 1. Request microphone access
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    });
+
+    // 2. Create AudioContext (runs at the device's native rate)
+    audioCtx = new AudioContext();
+    sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+
+    // 3. ScriptProcessorNode — grab raw PCM every BUFFER_MS
+    const nativeBufferLen = 4096;
+    scriptNode = audioCtx.createScriptProcessor(nativeBufferLen, CHANNELS, CHANNELS);
+
+    scriptNode.onaudioprocess = (evt) => {
+      if (!isRecording || ws.readyState !== WebSocket.OPEN) return;
+
+      // Input is Float32Array at the device's native sample rate
+      const float32Input = evt.inputBuffer.getChannelData(0);
+
+      // Resample + quantize to Int16 PCM @ SAMPLE_RATE, then send
+      const pcmBuffer = float32ToPcm16NoResample(float32Input);
+      ws.send(pcmBuffer);
+
+      // ---- Level meter ----
+      let sumSq = 0;
+      for (let i = 0; i < float32Input.length; i++) {
+        sumSq += float32Input[i] * float32Input[i];
+      }
+      const rms = Math.sqrt(sumSq / float32Input.length);
+      levelBar.style.width = Math.min(rms * 350, 100) + '%';
+    };
+
+    // Wire the audio graph
+    sourceNode.connect(scriptNode);
+    scriptNode.connect(audioCtx.destination); // keeps the graph "live"
+
+    isRecording = true;
+    btnStart.disabled  = true;
+    btnStop.disabled   = false;
+    setStatus('🔴 Recording & streaming...');
+    const actualChunkMs = nativeBufferLen / audioCtx.sampleRate * 1000;
+    log(`Capturing @ ${audioCtx.sampleRate} Hz, sending raw int16 PCM chunks of ~${actualChunkMs.toFixed(1)} ms`);
+
+  } catch (err) {
+    log(`❌ Microphone error: ${err.message}`);
+  }
+}
+
+function stopRecording() {
+  isRecording = false;
+  levelBar.style.width = '0%';
+
+  if (scriptNode) scriptNode.disconnect();
+  if (sourceNode) sourceNode.disconnect();
+  if (audioCtx)   audioCtx.close().catch(() => {});
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+
+  scriptNode  = null;
+  sourceNode  = null;
+  audioCtx    = null;
+  mediaStream = null;
+
+  btnStart.disabled = !isConnected;
+  btnStop.disabled  = true;
+  if (isConnected) setStatus('Connected (not recording)');
+  log('Recording stopped');
+}
+
+/* ================================================================
+   Resample Float32 → signed 16-bit PCM  (nearest-neighbor)
+   ================================================================
+   Takes a Float32Array at `fromRate` and produces an ArrayBuffer
+   of Int16 samples at `toRate`. Fast enough for real-time speech.
+   Swap in a sinc resampler if you need CD-quality accuracy.
+   ================================================================ */
+function float32ToPcm16NoResample(float32) {
+  const int16 = new Int16Array(float32.length);
+
+  for (let i = 0; i < float32.length; i++) {
+    let sample = float32[i];
+
+    if (sample > 1) sample = 1;
+    if (sample < -1) sample = -1;
+
+    int16[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+  }
+
+  return int16.buffer;
+}
+</script>
+</body>
+</html>
